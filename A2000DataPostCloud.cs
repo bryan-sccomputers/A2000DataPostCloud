@@ -31,7 +31,7 @@ namespace A2000DataPostCloud
             post_body ??= data?.post_body;
 
             //Post for auth token
-            RestClient authClient = new("http://spirit.a2000cloud.com:8890/ords/a2000/api/oauth/token")
+            RestClient authClient = new("http://spirit.a2000cloud.com:8890/ords/spirit/api/oauth/token")
             {
                 Timeout = -1
             };
@@ -45,7 +45,7 @@ namespace A2000DataPostCloud
             string token = tokenData.access_token;
 
             //Use auth token and make Post Upload to A2000 Cloud
-            RestClient client = new("http://spirit.a2000cloud.com:8890/ords/a2000/api/uploads/upload/" + table)
+            RestClient client = new("http://spirit.a2000cloud.com:8890/ords/spirit/api/uploads/upload/" + table)
             {
                 Timeout = -1,
                 Encoding = Encoding.Latin1
