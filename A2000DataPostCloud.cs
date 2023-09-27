@@ -36,7 +36,7 @@ namespace A2000DataPostCloud
                 Timeout = -1
             };
             RestRequest authRequest = new(Method.POST);
-            authRequest.AddHeader("Authorization", "Basic MHFUc2syX1FJRVJIaXIwb1dEM2ZvZy4uOldIdzlHSlZLTFBnQjNETjJjSkt4YncuLg==");
+            authRequest.AddHeader("Authorization", "Basic XzZBX0dwOUh4X1F3Q3p3MnlVcGFJdy4uOlROMW9pc1VVZkF4Qk9NMTc5UzJYTmcuLg==");
             authRequest.AddHeader("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8");
             authRequest.AddParameter("grant_type", "client_credentials");
             IRestResponse authResponse = authClient.Execute(authRequest);
