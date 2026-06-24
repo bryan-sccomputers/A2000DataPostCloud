@@ -214,6 +214,10 @@ namespace A2000DataPostCloud
                     post_body?.Length ?? 0,
                     decodedBody?.Length ?? 0);
 
+                log.LogInformation("Final A2000 upload payload. RunId: {RunId}. Payload: {Payload}",
+                    runId,
+                    decodedBody);
+
                 var client = new RestClient(uploadUrl);
                 client.Timeout = -1;
                 client.Encoding = Encoding.Latin1;
