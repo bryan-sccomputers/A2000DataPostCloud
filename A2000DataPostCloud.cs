@@ -220,7 +220,7 @@ namespace A2000DataPostCloud
 
                 var client = new RestClient(uploadUrl);
                 client.Timeout = -1;
-                client.Encoding = Encoding.Latin1;
+                client.Encoding = Encoding.UTF8;
 
                 var request = new RestRequest(Method.POST);
                 request.AddHeader("Authorization", $"Bearer {token}");
