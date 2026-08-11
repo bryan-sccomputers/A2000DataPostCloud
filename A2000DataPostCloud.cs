@@ -1,265 +1,692 @@
 using System;
 using System.IO;
+using System.Text;
 using System.Threading.Tasks;
+using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.Azure.WebJobs;
 using Microsoft.Azure.WebJobs.Extensions.Http;
-using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.Logging;
 using Newtonsoft.Json;
+using Newtonsoft.Json.Linq;
 using RestSharp;
-using System.Text;
 
 namespace A2000DataPostCloud
 {
     public static class A2000DataPostCloud
     {
-        public static string DecodeBody(string body)
-        {
-            return body?.Replace("%26", "&");
-        }
-
+        /// <summary>
+        /// Builds the HTTP Basic Authentication header required
+        /// by the A2000 OAuth endpoint.
+        /// </summary>
         private static string BuildBasicAuthHeader(string username, string password)
         {
             string rawValue = $"{username}:{password}";
-            string encodedValue = Convert.ToBase64String(Encoding.UTF8.GetBytes(rawValue));
+            string encodedValue = Convert.ToBase64String(
+                Encoding.UTF8.GetBytes(rawValue)
+            );
+
             return $"Basic {encodedValue}";
         }
 
+
         [FunctionName("A2000DataPostCloud")]
         public static async Task<IActionResult> Run(
-            [HttpTrigger(AuthorizationLevel.Function, "get", "post", Route = null)] HttpRequest req,
+            [HttpTrigger(
+                AuthorizationLevel.Function,
+                "get",
+                "post",
+                Route = null
+            )] HttpRequest req,
             ILogger log)
         {
             string runId = Guid.NewGuid().ToString();
 
-            log.LogInformation("A2000DataPost started. RunId: {RunId}", runId);
-            log.LogInformation("Request method: {Method}. Content-Type: {ContentType}", req.Method, req.ContentType);
-            if (req.Method.Equals("GET", StringComparison.OrdinalIgnoreCase))
+            log.LogInformation(
+                "A2000DataPostCloud started. RunId: {RunId}",
+                runId
+            );
+
+            log.LogInformation(
+                "Request method: {Method}. Content-Type: {ContentType}",
+                req.Method,
+                req.ContentType
+            );
+
+
+            /*
+             * ---------------------------------------------------------
+             * GET
+             * ---------------------------------------------------------
+             *
+             * GET is only used as a health/configuration test.
+             *
+             * Example:
+             *
+             * GET
+             * https://posta2kdatacloud.azurewebsites.net/
+             * api/A2000DataPostCloud?code=FUNCTION_KEY
+             *
+             */
+            if (req.Method.Equals(
+                "GET",
+                StringComparison.OrdinalIgnoreCase))
             {
-                string baseUrl = Environment.GetEnvironmentVariable("A2000_BASE_URL");
-                string username = Environment.GetEnvironmentVariable("A2000_AUTH_USER");
-                string password = Environment.GetEnvironmentVariable("A2000_AUTH_PASSWORD");
+                string baseUrl =
+                    Environment.GetEnvironmentVariable("A2000_BASE_URL");
+
+                string username =
+                    Environment.GetEnvironmentVariable("A2000_AUTH_USER");
+
+                string password =
+                    Environment.GetEnvironmentVariable("A2000_AUTH_PASSWORD");
+
 
                 return new OkObjectResult(new
                 {
-                    status = "SCM test successful",
+                    status = "A2000DataPostCloud test successful",
                     function = "A2000DataPostCloud",
                     timestampUtc = DateTime.UtcNow,
-                    hasBaseUrl = !string.IsNullOrWhiteSpace(baseUrl),
-                    hasUsername = !string.IsNullOrWhiteSpace(username),
-                    hasPassword = !string.IsNullOrWhiteSpace(password),
-                    method = req.Method
+
+                    environment = new
+                    {
+                        hasBaseUrl =
+                            !string.IsNullOrWhiteSpace(baseUrl),
+
+                        hasUsername =
+                            !string.IsNullOrWhiteSpace(username),
+
+                        hasPassword =
+                            !string.IsNullOrWhiteSpace(password)
+                    },
+
+                    method = req.Method,
+                    runId
                 });
             }
 
+
             try
             {
-                string table = req.Query["table"];
-                string post_body = req.Query["post_body"];
+                /*
+                 * ---------------------------------------------------------
+                 * READ REQUEST BODY
+                 * ---------------------------------------------------------
+                 *
+                 * Expected JSON:
+                 *
+                 * {
+                 *     "table": "style_reclass",
+                 *     "payload": {
+                 *         "IGNORE_ERRORS": "Y",
+                 *         "STYLE_RECLASS": [...]
+                 *     }
+                 * }
+                 *
+                 */
 
-                log.LogInformation("Query values received. RunId: {RunId}. Table from query exists: {HasTable}. Post body from query exists: {HasPostBody}",
+                string requestBody =
+                    await new StreamReader(req.Body).ReadToEndAsync();
+
+
+                log.LogInformation(
+                    "Request body read. RunId: {RunId}. Length: {Length}",
                     runId,
-                    !string.IsNullOrWhiteSpace(table),
-                    !string.IsNullOrWhiteSpace(post_body));
+                    requestBody?.Length ?? 0
+                );
 
-                string requestBody = await new StreamReader(req.Body).ReadToEndAsync();
 
-                log.LogInformation("Request body read. RunId: {RunId}. Body length: {BodyLength}",
-                    runId,
-                    requestBody?.Length ?? 0);
-
-                dynamic data = null;
-
-                if (!string.IsNullOrWhiteSpace(requestBody))
+                if (string.IsNullOrWhiteSpace(requestBody))
                 {
-                    try
-                    {
-                        data = JsonConvert.DeserializeObject(requestBody);
-                        log.LogInformation("Request body JSON parsed successfully. RunId: {RunId}", runId);
-                    }
-                    catch (Exception jsonEx)
-                    {
-                        log.LogError(jsonEx, "Failed to parse request body JSON. RunId: {RunId}. Body: {Body}",
-                            runId,
-                            requestBody);
+                    log.LogWarning(
+                        "Request body was empty. RunId: {RunId}",
+                        runId
+                    );
 
-                        return new BadRequestObjectResult("Invalid JSON in request body.");
-                    }
+                    return new BadRequestObjectResult(new
+                    {
+                        error = "Request body is required.",
+                        expectedFormat = new
+                        {
+                            table = "style_reclass",
+                            payload = new
+                            {
+                                IGNORE_ERRORS = "Y",
+                                STYLE_RECLASS = "..."
+                            }
+                        },
+                        runId
+                    });
                 }
-                else
+
+
+                /*
+                 * ---------------------------------------------------------
+                 * PARSE JSON
+                 * ---------------------------------------------------------
+                 */
+
+                JObject data;
+
+                try
                 {
-                    log.LogWarning("Request body was empty. RunId: {RunId}", runId);
+                    data = JObject.Parse(requestBody);
+                }
+                catch (JsonException jsonEx)
+                {
+                    log.LogError(
+                        jsonEx,
+                        "Invalid JSON request. RunId: {RunId}",
+                        runId
+                    );
+
+                    return new BadRequestObjectResult(new
+                    {
+                        error = "Invalid JSON in request body.",
+                        details = jsonEx.Message,
+                        runId
+                    });
                 }
 
-                table = table ?? data?.table;
-                post_body = post_body ?? data?.post_body;
 
-                log.LogInformation("Final input values resolved. RunId: {RunId}. Table: {Table}. Has post_body: {HasPostBody}",
-                    runId,
-                    table,
-                    !string.IsNullOrWhiteSpace(post_body));
+                /*
+                 * ---------------------------------------------------------
+                 * GET TABLE
+                 * ---------------------------------------------------------
+                 */
+
+                string table = data["table"]?.ToString()?.Trim();
+
 
                 if (string.IsNullOrWhiteSpace(table))
                 {
-                    log.LogWarning("Missing required value: table. RunId: {RunId}", runId);
-                    return new BadRequestObjectResult("Missing required value: table");
+                    log.LogWarning(
+                        "Missing table. RunId: {RunId}",
+                        runId
+                    );
+
+                    return new BadRequestObjectResult(new
+                    {
+                        error = "Missing required value: table",
+                        runId
+                    });
                 }
 
-                if (string.IsNullOrWhiteSpace(post_body))
+
+                /*
+                 * ---------------------------------------------------------
+                 * GET PAYLOAD
+                 * ---------------------------------------------------------
+                 */
+
+                JToken payloadToken = data["payload"];
+
+
+                if (payloadToken == null ||
+                    payloadToken.Type == JTokenType.Null)
                 {
-                    log.LogWarning("Missing required value: post_body. RunId: {RunId}", runId);
-                    return new BadRequestObjectResult("Missing required value: post_body");
+                    log.LogWarning(
+                        "Missing payload. RunId: {RunId}",
+                        runId
+                    );
+
+                    return new BadRequestObjectResult(new
+                    {
+                        error = "Missing required value: payload",
+                        runId
+                    });
                 }
 
-                string baseUrl = Environment.GetEnvironmentVariable("A2000_BASE_URL");
-                string username = Environment.GetEnvironmentVariable("A2000_AUTH_USER");
-                string password = Environment.GetEnvironmentVariable("A2000_AUTH_PASSWORD");
 
-                log.LogInformation("Environment variables checked. RunId: {RunId}. HasBaseUrl: {HasBaseUrl}. HasUsername: {HasUsername}. HasPassword: {HasPassword}",
+                /*
+                 * Serialize ONLY the payload portion.
+                 *
+                 * No URL decoding is needed.
+                 *
+                 * Characters such as:
+                 *
+                 * &
+                 * %
+                 * +
+                 * #
+                 * ®
+                 *
+                 * are safe because this JSON is being transmitted
+                 * in the HTTP request BODY, not inside the URL.
+                 */
+
+                string postBody =
+                    JsonConvert.SerializeObject(
+                        payloadToken,
+                        Formatting.None
+                    );
+
+
+                log.LogInformation(
+                    "Input resolved. RunId: {RunId}. Table: {Table}. PayloadLength: {PayloadLength}",
+                    runId,
+                    table,
+                    postBody.Length
+                );
+
+
+                /*
+                 * ---------------------------------------------------------
+                 * LOAD ENVIRONMENT VARIABLES
+                 * ---------------------------------------------------------
+                 */
+
+                string baseUrl =
+                    Environment.GetEnvironmentVariable("A2000_BASE_URL");
+
+                string username =
+                    Environment.GetEnvironmentVariable("A2000_AUTH_USER");
+
+                string password =
+                    Environment.GetEnvironmentVariable("A2000_AUTH_PASSWORD");
+
+
+                log.LogInformation(
+                    "Environment variables checked. RunId: {RunId}. " +
+                    "HasBaseUrl: {HasBaseUrl}. " +
+                    "HasUsername: {HasUsername}. " +
+                    "HasPassword: {HasPassword}",
                     runId,
                     !string.IsNullOrWhiteSpace(baseUrl),
                     !string.IsNullOrWhiteSpace(username),
-                    !string.IsNullOrWhiteSpace(password));
+                    !string.IsNullOrWhiteSpace(password)
+                );
+
 
                 if (string.IsNullOrWhiteSpace(baseUrl))
                 {
-                    log.LogError("Missing environment variable: A2000_BASE_URL. RunId: {RunId}", runId);
-                    return new BadRequestObjectResult("Missing environment variable: A2000_BASE_URL");
+                    log.LogError(
+                        "Missing A2000_BASE_URL. RunId: {RunId}",
+                        runId
+                    );
+
+                    return new ObjectResult(new
+                    {
+                        error =
+                            "Server configuration error: missing A2000_BASE_URL.",
+                        runId
+                    })
+                    {
+                        StatusCode = 500
+                    };
                 }
+
 
                 if (string.IsNullOrWhiteSpace(username))
                 {
-                    log.LogError("Missing environment variable: A2000_AUTH_USER. RunId: {RunId}", runId);
-                    return new BadRequestObjectResult("Missing environment variable: A2000_AUTH_USER");
+                    log.LogError(
+                        "Missing A2000_AUTH_USER. RunId: {RunId}",
+                        runId
+                    );
+
+                    return new ObjectResult(new
+                    {
+                        error =
+                            "Server configuration error: missing A2000_AUTH_USER.",
+                        runId
+                    })
+                    {
+                        StatusCode = 500
+                    };
                 }
+
 
                 if (string.IsNullOrWhiteSpace(password))
                 {
-                    log.LogError("Missing environment variable: A2000_AUTH_PASSWORD. RunId: {RunId}", runId);
-                    return new BadRequestObjectResult("Missing environment variable: A2000_AUTH_PASSWORD");
+                    log.LogError(
+                        "Missing A2000_AUTH_PASSWORD. RunId: {RunId}",
+                        runId
+                    );
+
+                    return new ObjectResult(new
+                    {
+                        error =
+                            "Server configuration error: missing A2000_AUTH_PASSWORD.",
+                        runId
+                    })
+                    {
+                        StatusCode = 500
+                    };
                 }
+
 
                 baseUrl = baseUrl.TrimEnd('/');
 
-                log.LogInformation("Base URL prepared. RunId: {RunId}. BaseUrl: {BaseUrl}",
-                    runId,
-                    baseUrl);
 
-                string basicAuthHeader = BuildBasicAuthHeader(username, password);
+                /*
+                 * ---------------------------------------------------------
+                 * AUTHENTICATE WITH A2000
+                 * ---------------------------------------------------------
+                 */
 
-                // Post for auth token
                 string authUrl = $"{baseUrl}/oauth/token";
 
-                log.LogInformation("Starting auth request. RunId: {RunId}. AuthUrl: {AuthUrl}",
-                    runId,
-                    authUrl);
+                string basicAuthHeader =
+                    BuildBasicAuthHeader(username, password);
 
-                var authClient = new RestClient(authUrl);
-                authClient.Timeout = -1;
+
+                log.LogInformation(
+                    "Starting A2000 authentication. RunId: {RunId}. AuthUrl: {AuthUrl}",
+                    runId,
+                    authUrl
+                );
+
+
+                var authClient = new RestClient(authUrl)
+                {
+                    Timeout = -1,
+                    Encoding = Encoding.UTF8
+                };
+
 
                 var authRequest = new RestRequest(Method.POST);
-                authRequest.AddHeader("Authorization", basicAuthHeader);
-                authRequest.AddHeader("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8");
-                authRequest.AddParameter("grant_type", "client_credentials");
 
-                IRestResponse authResponse = authClient.Execute(authRequest);
+                authRequest.AddHeader(
+                    "Authorization",
+                    basicAuthHeader
+                );
 
-                log.LogInformation("Auth response received. RunId: {RunId}. StatusCode: {StatusCode}. IsSuccessful: {IsSuccessful}. ResponseLength: {ResponseLength}",
+                authRequest.AddHeader(
+                    "Content-Type",
+                    "application/x-www-form-urlencoded; charset=UTF-8"
+                );
+
+                authRequest.AddParameter(
+                    "grant_type",
+                    "client_credentials"
+                );
+
+
+                IRestResponse authResponse =
+                    authClient.Execute(authRequest);
+
+
+                log.LogInformation(
+                    "Auth response received. RunId: {RunId}. " +
+                    "StatusCode: {StatusCode}. " +
+                    "IsSuccessful: {IsSuccessful}",
                     runId,
                     authResponse.StatusCode,
-                    authResponse.IsSuccessful,
-                    authResponse.Content?.Length ?? 0);
+                    authResponse.IsSuccessful
+                );
+
+
+                /*
+                 * ---------------------------------------------------------
+                 * HANDLE AUTH FAILURE
+                 * ---------------------------------------------------------
+                 */
 
                 if (!authResponse.IsSuccessful)
                 {
-                    log.LogError("Auth request failed. RunId: {RunId}. Status: {StatusCode}. ErrorMessage: {ErrorMessage}. Content: {Content}",
+                    log.LogError(
+                        "A2000 authentication failed. " +
+                        "RunId: {RunId}. " +
+                        "StatusCode: {StatusCode}. " +
+                        "ErrorMessage: {ErrorMessage}. " +
+                        "Response: {Response}",
                         runId,
                         authResponse.StatusCode,
                         authResponse.ErrorMessage,
-                        authResponse.Content);
+                        authResponse.Content
+                    );
 
-                    return new ObjectResult(authResponse.Content)
+
+                    return new ObjectResult(new
                     {
-                        StatusCode = (int)authResponse.StatusCode
+                        error = "A2000 authentication failed.",
+                        statusCode = (int)authResponse.StatusCode,
+                        response = authResponse.Content,
+                        runId
+                    })
+                    {
+                        StatusCode =
+                            (int)authResponse.StatusCode
                     };
                 }
 
-                dynamic tokenData = JsonConvert.DeserializeObject(authResponse.Content);
-                string token = tokenData?.access_token;
+
+                /*
+                 * ---------------------------------------------------------
+                 * READ ACCESS TOKEN
+                 * ---------------------------------------------------------
+                 */
+
+                JObject tokenData;
+
+                try
+                {
+                    tokenData =
+                        JObject.Parse(authResponse.Content);
+                }
+                catch (JsonException tokenEx)
+                {
+                    log.LogError(
+                        tokenEx,
+                        "Unable to parse A2000 auth response. RunId: {RunId}",
+                        runId
+                    );
+
+                    return new ObjectResult(new
+                    {
+                        error =
+                            "Unable to parse A2000 authentication response.",
+                        runId
+                    })
+                    {
+                        StatusCode = 500
+                    };
+                }
+
+
+                string token =
+                    tokenData["access_token"]?.ToString();
+
 
                 if (string.IsNullOrWhiteSpace(token))
                 {
-                    log.LogError("Auth succeeded but no access_token was returned. RunId: {RunId}. Content: {Content}",
-                        runId,
-                        authResponse.Content);
+                    log.LogError(
+                        "Authentication succeeded but no access_token was returned. RunId: {RunId}",
+                        runId
+                    );
 
-                    return new BadRequestObjectResult("Auth succeeded but no access_token was returned.");
-                }
 
-                log.LogInformation("Auth token received successfully. RunId: {RunId}", runId);
-
-                // Use auth token and make POST upload to A2000
-                string uploadUrl = $"{baseUrl}/uploads/upload/{table}";
-
-                log.LogInformation("Starting upload request. RunId: {RunId}. UploadUrl: {UploadUrl}. Table: {Table}",
-                    runId,
-                    uploadUrl,
-                    table);
-
-                string decodedBody = DecodeBody(post_body);
-
-                log.LogInformation("Post body decoded. RunId: {RunId}. OriginalLength: {OriginalLength}. DecodedLength: {DecodedLength}",
-                    runId,
-                    post_body?.Length ?? 0,
-                    decodedBody?.Length ?? 0);
-
-                //log.LogInformation("Final A2000 upload payload. RunId: {RunId}. Payload: {Payload}",
-                //    runId,
-                //    decodedBody);
-
-                var client = new RestClient(uploadUrl);
-                client.Timeout = -1;
-                client.Encoding = Encoding.UTF8;
-
-                var request = new RestRequest(Method.POST);
-                request.AddHeader("Authorization", $"Bearer {token}");
-                request.AddHeader("Content-Type", "application/json; charset=UTF-8");
-                request.AddParameter("application/json", decodedBody, ParameterType.RequestBody);
-
-                IRestResponse response = client.Execute(request);
-
-                log.LogInformation("Upload response received. RunId: {RunId}. StatusCode: {StatusCode}. IsSuccessful: {IsSuccessful}. ResponseLength: {ResponseLength}",
-                    runId,
-                    response.StatusCode,
-                    response.IsSuccessful,
-                    response.Content?.Length ?? 0);
-
-                if (!response.IsSuccessful)
-                {
-                    log.LogError("Upload request failed. RunId: {RunId}. Status: {StatusCode}. ErrorMessage: {ErrorMessage}. Content: {Content}",
-                        runId,
-                        response.StatusCode,
-                        response.ErrorMessage,
-                        response.Content);
-
-                    return new ObjectResult(response.Content)
+                    return new ObjectResult(new
                     {
-                        StatusCode = (int)response.StatusCode
+                        error =
+                            "Authentication succeeded but no access token was returned.",
+                        runId
+                    })
+                    {
+                        StatusCode = 500
                     };
                 }
 
-                log.LogInformation("A2000DataPost completed successfully. RunId: {RunId}. Table: {Table}",
+
+                log.LogInformation(
+                    "A2000 authentication successful. RunId: {RunId}",
+                    runId
+                );
+
+
+                /*
+                 * ---------------------------------------------------------
+                 * BUILD A2000 UPLOAD URL
+                 * ---------------------------------------------------------
+                 */
+
+                string uploadUrl =
+                    $"{baseUrl}/uploads/upload/{table}";
+
+
+                log.LogInformation(
+                    "Starting A2000 upload. RunId: {RunId}. Table: {Table}. URL: {UploadUrl}",
                     runId,
-                    table);
+                    table,
+                    uploadUrl
+                );
+
+
+                /*
+                 * ---------------------------------------------------------
+                 * SEND JSON TO A2000
+                 * ---------------------------------------------------------
+                 */
+
+                var client = new RestClient(uploadUrl)
+                {
+                    Timeout = -1,
+                    Encoding = Encoding.UTF8
+                };
+
+
+                var request = new RestRequest(Method.POST);
+
+
+                request.AddHeader(
+                    "Authorization",
+                    $"Bearer {token}"
+                );
+
+
+                request.AddHeader(
+                    "Content-Type",
+                    "application/json; charset=UTF-8"
+                );
+
+
+                /*
+                 * postBody is already valid JSON.
+                 *
+                 * Do NOT:
+                 *
+                 * Uri.EscapeDataString()
+                 * Replace("%26", "&")
+                 * URL encode it
+                 *
+                 * It is being sent as the HTTP body.
+                 */
+
+                request.AddParameter(
+                    "application/json",
+                    postBody,
+                    ParameterType.RequestBody
+                );
+
+
+                IRestResponse response =
+                    client.Execute(request);
+
+
+                /*
+                 * ---------------------------------------------------------
+                 * LOG A2000 RESPONSE
+                 * ---------------------------------------------------------
+                 */
+
+                log.LogInformation(
+                    "A2000 upload response received. " +
+                    "RunId: {RunId}. " +
+                    "StatusCode: {StatusCode}. " +
+                    "IsSuccessful: {IsSuccessful}. " +
+                    "ResponseLength: {ResponseLength}",
+                    runId,
+                    response.StatusCode,
+                    response.IsSuccessful,
+                    response.Content?.Length ?? 0
+                );
+
+
+                /*
+                 * ---------------------------------------------------------
+                 * HANDLE A2000 FAILURE
+                 * ---------------------------------------------------------
+                 */
+
+                if (!response.IsSuccessful)
+                {
+                    log.LogError(
+                        "A2000 upload failed. " +
+                        "RunId: {RunId}. " +
+                        "Table: {Table}. " +
+                        "StatusCode: {StatusCode}. " +
+                        "ErrorMessage: {ErrorMessage}. " +
+                        "Response: {Response}",
+                        runId,
+                        table,
+                        response.StatusCode,
+                        response.ErrorMessage,
+                        response.Content
+                    );
+
+
+                    return new ObjectResult(new
+                    {
+                        error = "A2000 upload failed.",
+                        table,
+                        statusCode =
+                            (int)response.StatusCode,
+                        response =
+                            response.Content,
+                        runId
+                    })
+                    {
+                        StatusCode =
+                            (int)response.StatusCode
+                    };
+                }
+
+
+                /*
+                 * ---------------------------------------------------------
+                 * SUCCESS
+                 * ---------------------------------------------------------
+                 */
+
+                log.LogInformation(
+                    "A2000DataPostCloud completed successfully. " +
+                    "RunId: {RunId}. Table: {Table}",
+                    runId,
+                    table
+                );
+
+
+                /*
+                 * Try to return A2000's JSON as actual JSON.
+                 *
+                 * If A2000 returned plain text, return it as text.
+                 */
 
                 return new OkObjectResult(response.Content);
             }
             catch (Exception ex)
             {
-                log.LogError(ex, "Unhandled exception in A2000DataPost. RunId: {RunId}", runId);
+                /*
+                 * ---------------------------------------------------------
+                 * UNHANDLED ERROR
+                 * ---------------------------------------------------------
+                 */
 
-                return new ObjectResult($"Unhandled error occurred. RunId: {runId}. Error: {ex.Message}")
+                log.LogError(
+                    ex,
+                    "Unhandled exception in A2000DataPostCloud. RunId: {RunId}",
+                    runId
+                );
+
+
+                return new ObjectResult(new
+                {
+                    error =
+                        "Unhandled error occurred.",
+                    message =
+                        ex.Message,
+                    runId
+                })
                 {
                     StatusCode = 500
                 };
